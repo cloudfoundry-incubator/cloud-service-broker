@@ -16,11 +16,15 @@
 package brokerpak
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/cloudfoundry-incubator/cloud-service-broker/pkg/providers/tf"
 	"github.com/cloudfoundry-incubator/cloud-service-broker/pkg/validation"
@@ -132,6 +136,11 @@ func (m *Manifest) Pack(base, dest string) error {
 		return err
 	}
 
+	log.Println("Packing terraform providers...")
+	if err := m.packProviders(dir, base); err != nil {
+		return err
+	}
+
 	log.Println("Creating archive:", dest)
 	return ziputil.Archive(dir, dest)
 }
@@ -156,6 +165,166 @@ func (m *Manifest) packBinaries(tmp string) error {
 			if err := getter.GetAny(platformPath, resource.Url(platform)); err != nil {
 				return err
 			}
+		}
+	}
+
+	return nil
+}
+
+func CopyProvider(sourcePath, destPath string) error {
+	// open source file
+	inputFile, err := os.Open(sourcePath)
+	if err != nil {
+		return fmt.Errorf("couldn't open source file: %s", err)
+	}
+
+	// create a new one
+	outputFile, err := os.Create(destPath)
+	if err != nil {
+		inputFile.Close()
+		return fmt.Errorf("couldn't open dest file: %s", err)
+	}
+
+	// copy source content to destination
+	defer outputFile.Close()
+	_, err = io.Copy(outputFile, inputFile)
+	inputFile.Close()
+	if err != nil {
+		return fmt.Errorf("writing to dest file failed: %s", err)
+	}
+
+	// change permission
+	err = os.Chmod(destPath, 0755)
+	if err != nil {
+		return fmt.Errorf("change perm on dest file failed: %s", err)
+	}
+
+	return nil
+}
+
+func visitTfFolder(tfCur string, tfTmp string, providers *map[string]bool) filepath.WalkFunc {
+	return func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// ignore the .terraform folder
+		if path == tfCur+"/.terraform/" {
+			return nil
+		}
+
+		// split to kept path
+		s := strings.Split(path, tfCur+"/.terraform/")
+
+		// create folder if not exists in tmp folder
+		if info.IsDir() {
+			_, err := os.Stat(filepath.Join(tfTmp, s[1]))
+			if os.IsNotExist(err) {
+				err := os.MkdirAll(filepath.Join(tfTmp, s[1]), 0755)
+				if err != nil {
+					return fmt.Errorf("unable to create folder in tmp %v", err)
+				}
+			}
+		}
+
+		// file ?
+		if !info.IsDir() {
+			tfBin := filepath.Base(path)
+
+			// just take in account file starting with terraform-provider
+			if strings.HasPrefix(tfBin, "terraform-provider-") {
+				exists := (*providers)[tfBin]
+				if !exists {
+					log.Printf("\t%s", tfBin)
+					(*providers)[tfBin] = true
+
+					// move the provider binary in the temp folder
+					err := CopyProvider(path, filepath.Join(tfTmp, s[1]))
+					if err != nil {
+						return fmt.Errorf("unable to copy provider in tmp %v", err)
+					}
+				}
+			}
+		}
+
+		return nil
+	}
+}
+
+func (m *Manifest) packProviders(tmp, base string) error {
+	err := os.MkdirAll(filepath.Join(tmp, "/terraform.d/providers"), 0755)
+	if err != nil {
+		return fmt.Errorf("unable to create terraform providers folder in tmp %v", err)
+	}
+
+	// search terraform folders in all services definitions
+	// duplicated folders are removed
+	tfDirs := make(map[string]bool)
+	for _, sd := range m.ServiceDefinitions {
+		defn := &tf.TfServiceDefinitionV1{}
+		if err := stream.Copy(stream.FromFile(base, sd), stream.ToYaml(defn)); err != nil {
+			return fmt.Errorf("couldn't parse %s: %v", sd, err)
+		}
+
+		if defn.ProvisionSettings.TemplateRef != "" {
+			tf_base := filepath.Dir(defn.ProvisionSettings.TemplateRef)
+			tfDirs[tf_base] = true
+		}
+
+		for _, ref := range defn.ProvisionSettings.TemplateRefs {
+			if ref != "" {
+				tfDirs[filepath.Dir(ref)] = true
+			}
+		}
+
+		if defn.BindSettings.TemplateRef != "" {
+			tf_base := filepath.Dir(defn.BindSettings.TemplateRef)
+			tfDirs[tf_base] = true
+		}
+
+		for _, ref := range defn.BindSettings.TemplateRefs {
+			if ref != "" {
+				tfDirs[filepath.Dir(ref)] = true
+			}
+		}
+
+	}
+
+	// execute terraform init on each folders
+	// duplicated providers are removed
+	providers := make(map[string]bool)
+	for _, platform := range m.Platforms {
+		for tfDir := range tfDirs {
+			platformPath := filepath.Join(tmp, "bin", platform.Os, platform.Arch)
+
+			// terraform path
+			tfDirPath := filepath.Join(base, tfDir)
+
+			// clean up terraform folder
+			os.RemoveAll(tfDirPath + "/.terraform/")
+
+			// execute terraform
+			cmd := exec.Command(platformPath+"/terraform", "init")
+			cmd.Dir = tfDirPath
+
+			var out bytes.Buffer
+			var stderr bytes.Buffer
+			cmd.Stdout = &out
+			cmd.Stderr = &stderr
+
+			err := cmd.Run()
+			if err != nil {
+				return fmt.Errorf(fmt.Sprint(err) + ": " + stderr.String())
+			}
+
+			// search plugins in the hidden terraform directory
+			err = filepath.Walk(tfDirPath+"/.terraform/", visitTfFolder(tfDirPath, tmp+"/terraform.d", &providers))
+			if err != nil {
+				return fmt.Errorf("walk on terraform failed: %v", err)
+			}
+
+			// clean up terraform folder
+			os.RemoveAll(tfDirPath + "/.terraform/")
 		}
 	}
 
