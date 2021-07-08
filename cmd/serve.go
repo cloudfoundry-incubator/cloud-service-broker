@@ -19,6 +19,8 @@ import (
 	"database/sql"
 	"net/http"
 
+	"github.com/cloudfoundry-incubator/cloud-service-broker/db_service/models"
+
 	"code.cloudfoundry.org/lager"
 	"github.com/cloudfoundry-incubator/cloud-service-broker/brokerapi/brokers"
 	"github.com/cloudfoundry-incubator/cloud-service-broker/db_service"
@@ -70,6 +72,7 @@ func init() {
 func serve() {
 	logger := utils.NewLogger("cloud-service-broker")
 	db := db_service.New(logger)
+	models.NewKey()
 
 	// init broker
 	cfg, err := brokers.NewBrokerConfigFromEnv(logger)
